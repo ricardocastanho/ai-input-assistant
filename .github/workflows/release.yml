@@ -1,0 +1,42 @@
+name: Build and Upload Release Zip
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build zip package
+        run: |
+          mkdir -p dist
+          cp manifest.json dist/
+          cp background.js dist/
+          cp content.js dist/
+          cp dialog.css dist/
+          if [ -d icons ]; then
+            cp -r icons dist/icons
+          fi
+          cd dist
+          zip -r "../ai-input-assistant-${{ github.ref_name }}.zip" .
+
+      - name: Upload zip as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-input-assistant-${{ github.ref_name }}
+          path: ai-input-assistant-${{ github.ref_name }}.zip
+
+      - name: Upload zip to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ai-input-assistant-${{ github.ref_name }}.zip
