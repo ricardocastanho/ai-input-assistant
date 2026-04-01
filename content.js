@@ -4,7 +4,8 @@
  * Tracks which input the user right-clicked, then opens a floating
  * dialog with a prompt field + voice recorder. On submit it calls
  * Chrome's built-in LanguageModel (Gemini Nano) and fills the target
- * input with the AI response.
+ * input with the AI response. If text was highlighted, only that range
+ * is replaced using the user's prompt.
  */
 
 (function () {
@@ -12,12 +13,40 @@
 
   // ─── State ───────────────────────────────────────────────────────────────────
   let targetInput = null; // The input/textarea the user right-clicked
+  /** @type {null | { kind: 'native', start: number, end: number } | { kind: 'contenteditable', range: Range }} */
+  let replaceSelection = null;
   let lastContextX = 0;
   let lastContextY = 0;
   let dialogEl = null;
   let mediaRecorder = null;
   let isRecording = false;
   let recognitionResult = "";
+
+  function captureReplaceSelection(el) {
+    replaceSelection = null;
+    if (!el) return;
+
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      if (
+        typeof start === "number" &&
+        typeof end === "number" &&
+        end > start
+      ) {
+        replaceSelection = { kind: "native", start, end };
+      }
+      return;
+    }
+
+    if (el.isContentEditable) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+      const range = sel.getRangeAt(0);
+      if (!el.contains(range.commonAncestorContainer)) return;
+      replaceSelection = { kind: "contenteditable", range: range.cloneRange() };
+    }
+  }
 
   // ─── Track right-click target ────────────────────────────────────────────────
   document.addEventListener(
@@ -30,6 +59,7 @@
         el.isContentEditable
       ) {
         targetInput = el;
+        captureReplaceSelection(el);
         lastContextX = e.clientX;
         lastContextY = e.clientY;
       } else {
@@ -39,6 +69,7 @@
         );
         if (editable) {
           targetInput = editable;
+          captureReplaceSelection(editable);
           lastContextX = e.clientX;
           lastContextY = e.clientY;
         }
@@ -75,6 +106,8 @@
       </div>
 
       <div class="aia-status" id="aia-status" role="status" aria-live="polite"></div>
+
+      <div class="aia-context" id="aia-context" hidden></div>
 
       <div class="aia-body">
         <div class="aia-prompt-wrap">
@@ -134,7 +167,20 @@
       document.addEventListener("mousedown", outsideClickHandler);
     }, 100);
 
-    dialogEl.querySelector("#aia-prompt").focus();
+    const promptEl = dialogEl.querySelector("#aia-prompt");
+    const ctxEl = dialogEl.querySelector("#aia-context");
+    if (replaceSelection) {
+      ctxEl.hidden = false;
+      ctxEl.textContent = "✂ Replacing your highlighted text (prompt describes the change)";
+      promptEl.placeholder =
+        "How should the selection change? (e.g. make it shorter, fix tone…)";
+    } else {
+      ctxEl.hidden = true;
+      ctxEl.textContent = "";
+      promptEl.placeholder = "Ask AI anything… or record your voice ↓";
+    }
+
+    promptEl.focus();
     showStatus(""); // clear
   }
 
@@ -164,6 +210,7 @@
 
   function closeDialog() {
     stopRecording();
+    replaceSelection = null;
     if (dialogEl) {
       dialogEl.remove();
       dialogEl = null;
@@ -277,6 +324,52 @@
   }
 
   // ─── AI Prompt Handling ───────────────────────────────────────────────────────
+  function buildFullPrompt(userPrompt, mode) {
+    const existingText = getInputValue(targetInput);
+
+    if (mode?.kind === "native") {
+      const selected = existingText.slice(mode.start, mode.end);
+      return `The user highlighted ONE contiguous portion of a text field. Replace ONLY that portion; your answer becomes the new text in place of the highlight.
+
+Selected text (replace this):
+"""
+${selected}
+"""
+
+Full field value (context only, do not output the whole field):
+"""
+${existingText}
+"""
+
+User instruction: ${userPrompt}
+
+Output ONLY the replacement text for the highlighted portion. No quotes, no explanation, no rest of the field.`;
+    }
+
+    if (mode?.kind === "contenteditable") {
+      const selected = mode.range.cloneRange().toString();
+      return `The user highlighted ONE portion of editable content. Replace ONLY that portion.
+
+Selected text (replace this):
+"""
+${selected}
+"""
+
+Full element text (context only, do not output the whole thing):
+"""
+${existingText}
+"""
+
+User instruction: ${userPrompt}
+
+Output ONLY the replacement text for the highlight. No quotes, no explanation.`;
+    }
+
+    return existingText
+      ? `The user is filling a text field that already contains:\n"${existingText}"\n\nUser's request: ${userPrompt}\n\nRespond with only the complete new text that should fill that input field. Do not add any explanation, preamble, or quotes. Just the text.`
+      : `${userPrompt}\n\nRespond with only the text content. No preamble, no explanation, no quotes around the answer.`;
+  }
+
   async function handleSend() {
     const promptEl = document.getElementById("aia-prompt");
     if (!promptEl) return;
@@ -287,11 +380,19 @@
       return;
     }
 
-    // Get any existing text in the target input to provide context
-    const existingText = getInputValue(targetInput);
-    const fullPrompt = existingText
-      ? `The user is filling a text field that already contains:\n"${existingText}"\n\nUser's request: ${userPrompt}\n\nRespond with only the complete new text that should fill that input field. Do not add any explanation, preamble, or quotes. Just the text.`
-      : `${userPrompt}\n\nRespond with only the text content. No preamble, no explanation, no quotes around the answer.`;
+    const mode = replaceSelection;
+    const fullPrompt = buildFullPrompt(userPrompt, mode);
+
+    let before = "";
+    let after = "";
+    let ceRangeBase = null;
+    if (mode?.kind === "native") {
+      const v = getInputValue(targetInput);
+      before = v.slice(0, mode.start);
+      after = v.slice(mode.end);
+    } else if (mode?.kind === "contenteditable") {
+      ceRangeBase = mode.range.cloneRange();
+    }
 
     setThinking(true);
     showStatus("⚡ Connecting to Gemini Nano…", "info");
@@ -331,26 +432,71 @@
 
       showStatus("✦ Generating response…", "info");
 
-      // Stream the response for better UX
       const stream = session.promptStreaming(fullPrompt);
       let fullResponse = "";
+      let ceTextNode = null;
 
       for await (const chunk of stream) {
         fullResponse += chunk;
+        if (!targetInput) continue;
 
-        // Optionally show a live preview in the target field
-        if (targetInput) {
+        if (mode?.kind === "native") {
+          setInputValue(targetInput, before + fullResponse + after);
+        } else if (mode?.kind === "contenteditable" && ceRangeBase) {
+          if (!ceTextNode) {
+            targetInput.focus();
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(ceRangeBase.cloneRange());
+            const r = sel.getRangeAt(0);
+            r.deleteContents();
+            ceTextNode = document.createTextNode(fullResponse);
+            r.insertNode(ceTextNode);
+            sel.collapse(ceTextNode, ceTextNode.length);
+          } else {
+            ceTextNode.data = fullResponse;
+          }
+          targetInput.dispatchEvent(new Event("input", { bubbles: true }));
+        } else if (!mode) {
           setInputValue(targetInput, fullResponse);
         }
       }
 
       session.destroy();
 
-      // Final clean result
       const cleaned = fullResponse.trim();
-      if (targetInput) setInputValue(targetInput, cleaned);
+      if (targetInput) {
+        if (mode?.kind === "native") {
+          setInputValue(targetInput, before + cleaned + after);
+          if (typeof targetInput.setSelectionRange === "function") {
+            const pos = before.length + cleaned.length;
+            targetInput.setSelectionRange(pos, pos);
+          }
+        } else if (mode?.kind === "contenteditable") {
+          if (ceTextNode) {
+            ceTextNode.data = cleaned;
+          } else if (ceRangeBase) {
+            targetInput.focus();
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(ceRangeBase.cloneRange());
+            const r = sel.getRangeAt(0);
+            r.deleteContents();
+            if (cleaned) r.insertNode(document.createTextNode(cleaned));
+          }
+          targetInput.dispatchEvent(new Event("input", { bubbles: true }));
+          targetInput.dispatchEvent(new Event("change", { bubbles: true }));
+        } else {
+          setInputValue(targetInput, cleaned);
+        }
+      }
 
-      showStatus("✓ Done! Your input has been filled.", "success");
+      showStatus(
+        mode
+          ? "✓ Selection updated."
+          : "✓ Done! Your input has been filled.",
+        "success",
+      );
       setTimeout(closeDialog, 1200);
     } catch (err) {
       console.error("[AI Assistant]", err);
